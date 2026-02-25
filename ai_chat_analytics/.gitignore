@@ -1,0 +1,23 @@
+# Secrets — never commit these
+local_settings.py
+
+# Database
+db.sqlite3
+*.sqlite3
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment / secrets
+.env
+.env.*
+
+# Django
+staticfiles/
+media/
+
+# OS
+.DS_Store
+Thumbs.db
