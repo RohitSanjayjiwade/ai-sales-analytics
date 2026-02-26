@@ -82,9 +82,15 @@ export default function ChatWindow({ messages, status, loading, onSend, onOpenSi
           /* Message list — stick to bottom */
           <div className="min-h-full flex flex-col justify-end">
             <div className="pt-4 pb-2 max-w-4xl mx-auto w-full">
-              {messages.map((msg) => (
-                <MessageBubble key={msg.id} message={msg} />
-              ))}
+              {messages.map((msg, idx) => {
+                const prevMsg = messages[idx - 1]
+                const isNewTurn = msg.role === 'user' && idx > 0 && prevMsg?.role === 'assistant'
+                return (
+                  <div key={msg.id} className={isNewTurn ? 'mt-6' : undefined}>
+                    <MessageBubble message={msg} />
+                  </div>
+                )
+              })}
             </div>
 
             {/* Bouncing dots status */}

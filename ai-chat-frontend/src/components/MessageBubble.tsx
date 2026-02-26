@@ -111,8 +111,8 @@ export default function MessageBubble({ message }: Props) {
   const [copied, setCopied] = useState(false)
 
   const copySQL = () => {
-    if (!message.sql) return
-    navigator.clipboard.writeText(message.sql)
+    if (!message.sqls?.length) return
+    navigator.clipboard.writeText(message.sqls.join(';\n\n'))
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -133,7 +133,7 @@ export default function MessageBubble({ message }: Props) {
       <div className={cn('flex flex-col gap-2', isUser ? 'items-end max-w-[72%]' : 'flex-1 min-w-0')}>
 
         {/* SQL thinking panel (assistant only) */}
-        {!isUser && message.sql && (
+        {!isUser && message.sqls?.length && (
           <div className="w-full rounded-xl border border-[var(--app-border)] bg-[var(--app-sql-header)] overflow-hidden">
             {/* Header */}
             <button
@@ -151,7 +151,7 @@ export default function MessageBubble({ message }: Props) {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                 </svg>
                 <span className="text-[11px] text-[var(--app-text-muted)] group-hover:text-[var(--app-text)] transition-colors">
-                  Query executed
+                  {message.sqls.length > 1 ? `${message.sqls.length} queries executed` : 'Query executed'}
                 </span>
               </div>
               <span className="text-[10px] font-mono text-[var(--app-text-subtle)] bg-[var(--app-input-bg)] border border-[var(--app-border-strong)] px-1.5 py-0.5 rounded">
@@ -162,18 +162,28 @@ export default function MessageBubble({ message }: Props) {
             {/* Body (animated) */}
             <div className={cn('sql-collapsible', sqlOpen && 'open')}>
               <div>
-                <div className="border-t border-[var(--app-border)] bg-[var(--app-sql-body)] relative">
-                  {/* Copy button */}
-                  <button
-                    onClick={copySQL}
-                    className="absolute top-2.5 right-3 text-[10px] text-[var(--app-text-faint)] hover:text-[var(--app-text-muted)] bg-[var(--app-input-bg)] border border-[var(--app-border)] px-2 py-0.5 rounded transition-colors cursor-pointer"
-                  >
-                    {copied ? '✓ copied' : 'copy'}
-                  </button>
-                  <pre className="px-4 py-3 text-[12px] leading-relaxed font-mono overflow-x-auto">
-                    <SQLHighlight sql={message.sql} />
-                  </pre>
-                </div>
+                {message.sqls.map((sql, idx) => (
+                  <div key={idx} className="border-t border-[var(--app-border)] bg-[var(--app-sql-body)] relative">
+                    {/* Copy button — only on last query */}
+                    {idx === message.sqls!.length - 1 && (
+                      <button
+                        onClick={copySQL}
+                        className="absolute top-2.5 right-3 text-[10px] text-[var(--app-text-faint)] hover:text-[var(--app-text-muted)] bg-[var(--app-input-bg)] border border-[var(--app-border)] px-2 py-0.5 rounded transition-colors cursor-pointer"
+                      >
+                        {copied ? '✓ copied' : 'copy all'}
+                      </button>
+                    )}
+                    {/* Query label if multiple */}
+                    {message.sqls!.length > 1 && (
+                      <span className="px-4 pt-2.5 pb-0 text-[10px] text-[var(--app-text-faint)] font-mono block">
+                        Query {idx + 1}
+                      </span>
+                    )}
+                    <pre className="px-4 py-3 text-[12px] leading-relaxed font-mono overflow-x-auto">
+                      <SQLHighlight sql={sql} />
+                    </pre>
+                  </div>
+                ))}
               </div>
             </div>
           </div>

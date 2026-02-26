@@ -68,7 +68,11 @@ export function useChat() {
         if (event.type === 'sql') {
           setMessages((prev) => {
             const updated = [...prev]
-            updated[updated.length - 1] = { ...updated[updated.length - 1], sql: event.query }
+            const last = updated[updated.length - 1]
+            updated[updated.length - 1] = {
+              ...last,
+              sqls: [...(last.sqls ?? []), event.query],
+            }
             return updated
           })
         }

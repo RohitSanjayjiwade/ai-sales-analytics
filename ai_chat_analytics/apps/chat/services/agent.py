@@ -8,6 +8,7 @@ from .schema_extractor import SchemaExtractor
 from .sql_validator import SQLValidator
 from .query_executor import QueryExecutor
 from .business_context import BUSINESS_CONTEXT
+from ..models import ChatMessage, QueryAuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class AgentResult:
 
 
 class ChatAgent:
-    MAX_TOOL_ITERATIONS = 5  # prevent infinite loops
+    MAX_TOOL_ITERATIONS = 5
 
     def __init__(self):
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -121,11 +122,10 @@ HOW TO HANDLE DATES in SQL (replace 'column' with actual column name):
             month_cond=month_cond,
         )
 
-    def run(self, user_question):
+    def _build_system_prompt(self):
         schema = self.schema_extractor.get_schema()
         datetime_context = self._get_datetime_context()
-
-        system_prompt = """You are a business intelligence assistant with access to a database.
+        return """You are a business intelligence assistant with access to a database.
 Use the execute_sql tool to fetch data when answering questions.
 
 DATABASE SCHEMA:
@@ -141,10 +141,29 @@ RULES:
 - After getting data, respond clearly and concisely
 - Format currency values nicely using the ₹ symbol (e.g. ₹1,234.56) — never use $
 - If no data found, say so clearly
-""".format(schema=schema, datetime_context=datetime_context, context=BUSINESS_CONTEXT)
 
+MULTI-PART QUESTIONS:
+- If a question has multiple parts, call execute_sql SEPARATELY for each part
+- Never assume or hardcode values — always query to find them dynamically
+- Example: "which day had most cancellations" → run a query to find that day first, then use the result in the next query
+
+LIMIT RULES (strictly follow):
+- Aggregation queries (SUM, COUNT, AVG, MAX, MIN, GROUP BY): NO LIMIT clause needed
+- Listing / detail queries (SELECT columns or SELECT *): use LIMIT 50
+- Top-N queries where user specifies a number (e.g. "top 5", "show 100"): use that exact number, never exceed 200
+- If user says "show all" or "all records": use LIMIT 50 and mention total count separately using COUNT(*)
+- Never use arbitrary large limits like 500, 1000, etc""".format(
+            schema=schema,
+            datetime_context=datetime_context,
+            context=BUSINESS_CONTEXT,
+        )
+
+    # ─────────────────────────────────────────
+    #  Non-streaming run
+    # ─────────────────────────────────────────
+    def run(self, user_question, session=None):
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": self._build_system_prompt()},
             {"role": "user", "content": user_question},
         ]
 
@@ -166,7 +185,7 @@ RULES:
                     model="gpt-4o",
                     messages=messages,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice="required" if iterations == 1 else "auto",
                     temperature=0,
                     max_tokens=1024,
                 )
@@ -174,7 +193,6 @@ RULES:
                 choice = response.choices[0]
                 logger.debug("OpenAI finish_reason : %s", choice.finish_reason)
 
-                # Add AI message to history
                 messages.append(choice.message)
 
                 if choice.finish_reason == "tool_calls":
@@ -187,26 +205,45 @@ RULES:
                             logger.info("── STEP 1: AI Generated SQL ──")
                             logger.info("%s", sql)
 
-                            # Validate
                             validation = self.validator.validate(sql)
                             if not validation.is_valid:
                                 tool_result = "Validation error: {}. Please fix the SQL.".format(validation.error)
                                 logger.warning("── STEP 2: VALIDATION FAILED — %s", validation.error)
+                                if session:
+                                    QueryAuditLog.objects.create(
+                                        session=session,
+                                        user_question=user_question,
+                                        generated_sql=sql,
+                                        error=validation.error,
+                                    )
                             else:
                                 logger.info("── STEP 2: SQL Validated OK ──")
 
-                                # Execute
                                 result = self.executor.execute(validation.sanitized_sql)
                                 if result.success:
                                     row_count = result.row_count
                                     tool_result = json.dumps(result.rows, cls=DecimalEncoder)
                                     logger.info("── STEP 3: DB RETURNED %d row(s) in %dms ──", result.row_count, result.execution_time_ms)
                                     logger.debug("RAW DATA : %s", result.rows)
+                                    if session:
+                                        QueryAuditLog.objects.create(
+                                            session=session,
+                                            user_question=user_question,
+                                            generated_sql=validation.sanitized_sql,
+                                            row_count=result.row_count,
+                                            execution_time_ms=result.execution_time_ms,
+                                        )
                                 else:
                                     tool_result = "Query execution error: {}. Please fix the SQL.".format(result.error)
                                     logger.warning("── STEP 3: DB QUERY FAILED — %s", result.error)
+                                    if session:
+                                        QueryAuditLog.objects.create(
+                                            session=session,
+                                            user_question=user_question,
+                                            generated_sql=validation.sanitized_sql,
+                                            error=result.error,
+                                        )
 
-                            # Feed result back to AI
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call.id,
@@ -215,12 +252,22 @@ RULES:
                             logger.debug("── DB result sent back to OpenAI ──")
 
                 elif choice.finish_reason == "stop":
+                    final_text = choice.message.content
                     logger.info("── STEP 4: FINAL RESPONSE ──")
-                    logger.info("%s", choice.message.content)
+                    logger.info("%s", final_text)
                     logger.info("━" * 60)
+
+                    if session:
+                        ChatMessage.objects.create(
+                            session=session,
+                            role=ChatMessage.Role.ASSISTANT,
+                            content=final_text,
+                            status=ChatMessage.Status.SUCCESS,
+                        )
+
                     return AgentResult(
                         success=True,
-                        response=choice.message.content,
+                        response=final_text,
                         sql_used=sql_used,
                         row_count=row_count,
                     )
@@ -230,14 +277,156 @@ RULES:
 
         except Exception as e:
             logger.exception("Agent error: %s", str(e))
+            if session:
+                ChatMessage.objects.create(
+                    session=session,
+                    role=ChatMessage.Role.ASSISTANT,
+                    content="Service error: {}".format(str(e)),
+                    status=ChatMessage.Status.FAILED,
+                )
             return AgentResult(
                 success=False,
                 response="Service error: {}".format(str(e)),
                 error=str(e),
             )
 
+        if session:
+            ChatMessage.objects.create(
+                session=session,
+                role=ChatMessage.Role.ASSISTANT,
+                content="Sorry, I could not process your question. Please try rephrasing it.",
+                status=ChatMessage.Status.FAILED,
+            )
         return AgentResult(
             success=False,
             response="Sorry, I could not process your question. Please try rephrasing it.",
             error="Max iterations reached or unexpected finish reason",
         )
+
+    # ─────────────────────────────────────────
+    #  Streaming run (SSE generator)
+    # ─────────────────────────────────────────
+    def stream_run(self, question, session):
+        """Yields SSE-formatted strings. Contains all streaming business logic."""
+
+        messages = [
+            {"role": "system", "content": self._build_system_prompt()},
+            {"role": "user", "content": question},
+        ]
+
+        row_count = 0
+        iterations = 0
+
+        yield "data: {}\n\n".format(json.dumps({'type': 'status', 'message': 'Analyzing your question...'}))
+
+        try:
+            while iterations < self.MAX_TOOL_ITERATIONS:
+                iterations += 1
+
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="required" if iterations == 1 else "auto",
+                    temperature=0,
+                    max_tokens=1024,
+                )
+
+                choice = response.choices[0]
+
+                # ── Tool call — execute SQL and feed result back ──────────────
+                if choice.finish_reason == "tool_calls":
+                    messages.append(choice.message)
+
+                    for tool_call in choice.message.tool_calls:
+                        if tool_call.function.name == "execute_sql":
+                            args = json.loads(tool_call.function.arguments)
+                            sql = args.get("sql", "")
+
+                            logger.info("STREAM AGENT — SQL (iteration %d): %s", iterations, sql)
+                            yield "data: {}\n\n".format(json.dumps({'type': 'sql', 'query': sql}))
+                            yield "data: {}\n\n".format(json.dumps({'type': 'status', 'message': 'Fetching data...'}))
+
+                            validation = self.validator.validate(sql)
+                            if not validation.is_valid:
+                                tool_result = "Validation error: {}. Please fix the SQL.".format(validation.error)
+                                logger.warning("STREAM AGENT — Validation failed: %s", validation.error)
+                                QueryAuditLog.objects.create(
+                                    session=session,
+                                    user_question=question,
+                                    generated_sql=sql,
+                                    error=validation.error,
+                                )
+                            else:
+                                result = self.executor.execute(validation.sanitized_sql)
+                                if result.success:
+                                    row_count = result.row_count
+                                    tool_result = json.dumps(result.rows, cls=DecimalEncoder)
+                                    logger.info("STREAM AGENT — DB returned %d rows in %dms", result.row_count, result.execution_time_ms)
+                                    QueryAuditLog.objects.create(
+                                        session=session,
+                                        user_question=question,
+                                        generated_sql=validation.sanitized_sql,
+                                        row_count=result.row_count,
+                                        execution_time_ms=result.execution_time_ms,
+                                    )
+                                else:
+                                    tool_result = "Query execution error: {}. Please fix the SQL.".format(result.error)
+                                    logger.warning("STREAM AGENT — Query failed: %s", result.error)
+                                    QueryAuditLog.objects.create(
+                                        session=session,
+                                        user_question=question,
+                                        generated_sql=validation.sanitized_sql,
+                                        error=result.error,
+                                    )
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": tool_result,
+                            })
+
+                # ── Final answer — re-request with streaming for live typing ──
+                elif choice.finish_reason == "stop":
+                    yield "data: {}\n\n".format(json.dumps({'type': 'status', 'message': 'Preparing response...'}))
+
+                    full_response = []
+                    stream = self.client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=messages,
+                        stream=True,
+                        temperature=0,
+                        max_tokens=1024,
+                    )
+
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            full_response.append(delta)
+                            yield "data: {}\n\n".format(json.dumps({'type': 'chunk', 'content': delta}))
+
+                    final_text = ''.join(full_response)
+
+                    ChatMessage.objects.create(
+                        session=session,
+                        role=ChatMessage.Role.ASSISTANT,
+                        content=final_text,
+                        status=ChatMessage.Status.SUCCESS,
+                    )
+
+                    yield "data: {}\n\n".format(json.dumps({
+                        'type': 'done',
+                        'session_id': str(session.id),
+                        'row_count': row_count,
+                    }))
+                    return
+
+                else:
+                    break
+
+        except Exception as e:
+            logger.exception("Stream agent error: %s", str(e))
+            yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'Service error: {}'.format(str(e))}))
+            return
+
+        yield "data: {}\n\n".format(json.dumps({'type': 'error', 'message': 'Could not process your question. Please try rephrasing it.'}))

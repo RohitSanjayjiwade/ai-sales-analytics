@@ -4,7 +4,7 @@ export interface Message {
   content: string
   status?: 'success' | 'failed'
   created_at?: string
-  sql?: string
+  sqls?: string[]
 }
 
 export interface Session {
